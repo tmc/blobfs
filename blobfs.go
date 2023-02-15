@@ -1,29 +1,36 @@
 package blobfs
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"io/fs"
-	"net/http"
 	"strings"
-	"time"
 
 	"gocloud.dev/blob"
-	// gcs support
-	_ "gocloud.dev/blob/gcsblob"
 )
 
+// version defines a set of rules and policies regarding how files are served out of a blobfs source.
 type version string
 
-// V1 encodes the asset serving strategy.
-// In version 1, the assets are served from a subdirectory in the bucket that matches the scheme:
-// "gcs://{bucket}/v1/{subPath}/{version}/*".
-const V1 = "v1"
-
+// blobFS is a filesystem backed by a gocloud *blob.Bucket.
 type blobFS struct {
-	bucket *blob.Bucket
+	version version
+	bucket  *blob.Bucket
+	prefix  string // The surrounding Handler calls fs.Sub() so this should be infrequently accessed.
+}
+
+// Statically assert that blobFS implements fs.FS.
+var _ fs.FS = (*blobFS)(nil)
+
+// New returns a new blobFS.
+func New(version version, bucket *blob.Bucket, prefix string) (*blobFS, error) {
+	subPath := fmt.Sprintf("%s/%s/", version, strings.TrimSuffix(prefix, "/"))
+	b := &blobFS{
+		version: version,
+		bucket:  blob.PrefixedBucket(bucket, subPath),
+		prefix:  prefix,
+	}
+	return b, nil
 }
 
 // Open opens the named file.
@@ -36,98 +43,48 @@ type blobFS struct {
 // ValidPath(name), returning a *PathError with Err set to
 // ErrInvalid or ErrNotExist.
 func (b *blobFS) Open(name string) (fs.File, error) {
-	return &blobFile{
+	if name == "." {
+		return &blobFile{
+			fs:   b,
+			name: "",
+		}, nil
+	}
+	exists, err := b.exists(name)
+	if !exists {
+		return nil, &fs.PathError{
+			Op:   "open",
+			Path: name,
+			Err:  fs.ErrNotExist,
+		}
+	}
+	if err != nil {
+		return nil, &fs.PathError{
+			Op:   "open",
+			Path: name,
+			Err:  err,
+		}
+	}
+	bf := &blobFile{
 		fs:   b,
-		path: name,
-	}, nil
-}
-
-// Statically decare that blobFS implements fs.FS
-var _ fs.FS = (*blobFS)(nil)
-
-type blobFile struct {
-	fs   *blobFS
-	path string
-}
-
-func (b *blobFile) Stat() (fs.FileInfo, error) {
-	fmt.Println("stat:", b.path)
-	attrs, err := b.fs.bucket.Attributes(context.Background(), b.path)
-	return &blobFileInfo{
-		name:  b.path,
-		attrs: attrs,
-	}, err
-}
-
-// Read reads the named file into buf and returns the number of bytes read and an error, if any.
-func (b *blobFile) Read(buf []byte) (int, error) {
-	contents, err := b.fs.bucket.ReadAll(context.Background(), b.path)
-	if err != nil {
-		fmt.Println("read error", err)
-		return 0, err
+		name: name,
 	}
-	// TODO(tmc): see if we can avoid this copy.
-	w := bytes.NewBuffer(buf)
-	n, err := io.Copy(w, bytes.NewBuffer(contents))
-	return int(n), err
+	return bf, nil
 }
 
-func (b *blobFile) Close() error {
-	return nil
-}
-
-type blobFileInfo struct {
-	name  string
-	attrs *blob.Attributes
-}
-
-func (b *blobFileInfo) Name() string {
-	return b.name
-}
-
-func (b *blobFileInfo) Size() int64 {
-	fmt.Println("reading size:", b.attrs.Size)
-	return b.attrs.Size
-}
-
-func (b *blobFileInfo) Mode() fs.FileMode {
-	fmt.Println("Mode called")
-	panic("not implemented") // TODO: Implement
-}
-
-func (b *blobFileInfo) ModTime() time.Time {
-	fmt.Println("mod time callled:", b.attrs.ModTime)
-	return b.attrs.ModTime
-}
-
-func (b *blobFileInfo) IsDir() bool {
-	fmt.Println("IsDir called")
-	return strings.HasSuffix(b.name, "/")
-}
-
-func (b *blobFileInfo) Sys() any {
-	fmt.Println("Sys called")
-	panic("not implemented") // TODO: Implement
-}
-
-// NewHandler returns a new http.Handler that serves assets from the given bucket.
-func NewHandler(ctx context.Context, bucketName string, version version, subPath string) (http.Handler, error) {
-	var (
-		h   *blobFS
-		err error
-	)
-	h = &blobFS{}
-	blobBucketURL := "gs://" + bucketName
-	h.bucket, err = blob.OpenBucket(ctx, blobBucketURL)
-	fmt.Println("open bucket:", blobBucketURL, h, err)
-	if err != nil {
-		// TODO: consider if we want some fallback behavior.
-		return nil, err
+// exists returns true if the given name exists.
+func (b *blobFS) exists(name string) (bool, error) {
+	// first check for exact blob.
+	fileExists, err := b.bucket.Exists(context.Background(), name)
+	if fileExists {
+		return true, err
 	}
-	fs, err := fs.Sub(h, fmt.Sprintf("v1/%v", subPath))
+	// then check for prefix.
+	r, _, err := b.bucket.ListPage(context.Background(), blob.FirstPageToken, 1, &blob.ListOptions{
+		Prefix:    name,
+		Delimiter: "/",
+	})
 	if err != nil {
-		// TODO: consider if we want some fallback behavior.
-		return nil, err
+		return false, err
 	}
-	return http.FileServer(http.FS(fs)), err
+	return len(r) > 0, nil
 }
